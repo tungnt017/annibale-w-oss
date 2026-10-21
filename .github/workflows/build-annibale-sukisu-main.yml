@@ -1,0 +1,187 @@
+name: Build Annibale kernel with SukiSU-Ultra main
+
+on:
+  workflow_dispatch:
+    inputs:
+      defconfig:
+        description: "Optional defconfig override; leave empty for auto-detection"
+        required: false
+        default: ""
+      ksu_ref:
+        description: "SukiSU-Ultra branch/tag/commit"
+        required: true
+        default: "main"
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/build-annibale-sukisu-main.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: annibale-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  KERNEL_REPO: https://github.com/MiCode/Xiaomi_Kernel_OpenSource.git
+  KERNEL_BRANCH: annibale-w-oss
+  OUT_DIR: out
+  ARCH: arm64
+  SUBARCH: arm64
+  KBUILD_BUILD_USER: github-actions
+  KBUILD_BUILD_HOST: github
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+
+    steps:
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+          docker-images: true
+          swap-storage: false
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc bison build-essential ca-certificates ccache clang curl flex \
+            git lld llvm libelf-dev libssl-dev libncurses-dev pahole \
+            python3 rsync zip zstd
+
+      - name: Clone Xiaomi kernel source
+        run: |
+          git clone --depth=1 --single-branch \
+            --branch "$KERNEL_BRANCH" "$KERNEL_REPO" kernel
+
+      - name: Integrate SukiSU-Ultra main branch
+        working-directory: kernel
+        env:
+          KSU_REF: ${{ inputs.ksu_ref || 'main' }}
+        run: |
+          set -euxo pipefail
+          curl -LSs \
+            "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/${KSU_REF}/kernel/setup.sh" \
+            | bash -s "$KSU_REF"
+          test -e drivers/kernelsu
+
+      - name: Auto-detect and configure kernel
+        working-directory: kernel
+        env:
+          DEFCONFIG_OVERRIDE: ${{ inputs.defconfig || '' }}
+        run: |
+          set -euo pipefail
+
+          normalize_config() {
+            local value="$1"
+            value="${value#arch/arm64/configs/}"
+            printf '%s\n' "$value"
+          }
+
+          is_valid_config() {
+            test -n "$1" && test -f "arch/arm64/configs/$1"
+          }
+
+          DEFCONFIG=""
+
+          # 1. Respect an explicit workflow input when supplied.
+          if [ -n "$DEFCONFIG_OVERRIDE" ]; then
+            DEFCONFIG="$(normalize_config "$DEFCONFIG_OVERRIDE")"
+            if ! is_valid_config "$DEFCONFIG"; then
+              echo "Requested defconfig not found: arch/arm64/configs/$DEFCONFIG" >&2
+              exit 1
+            fi
+          fi
+
+          # 2. Look for DEFCONFIG declarations in Android build.config files.
+          if [ -z "$DEFCONFIG" ]; then
+            while IFS= read -r candidate; do
+              candidate="$(normalize_config "$candidate")"
+              if is_valid_config "$candidate"; then
+                DEFCONFIG="$candidate"
+                break
+              fi
+            done < <(
+              grep -RhsE '^[[:space:]]*(export[[:space:]]+)?DEFCONFIG='                 --include='build.config*' . 2>/dev/null               | sed -E 's/^[[:space:]]*(export[[:space:]]+)?DEFCONFIG=["'"']?([^"'"'[:space:]]+).*/\2/'               | awk 'NF && !seen[$0]++'
+            )
+          fi
+
+          # 3. Prefer a device-specific Annibale defconfig.
+          if [ -z "$DEFCONFIG" ]; then
+            DEFCONFIG="$(
+              find arch/arm64/configs -type f                 \( -iname '*annibale*defconfig' -o -iname '*annibale*_defconfig' \)                 -printf '%P\n' | sort | head -n 1
+            )"
+          fi
+
+          # 4. Fall back to GKI, vendor defconfig, then any arm64 defconfig.
+          if [ -z "$DEFCONFIG" ] && is_valid_config "gki_defconfig"; then
+            DEFCONFIG="gki_defconfig"
+          fi
+          if [ -z "$DEFCONFIG" ]; then
+            DEFCONFIG="$(find arch/arm64/configs/vendor -type f -name '*defconfig'               -printf 'vendor/%P\n' 2>/dev/null | sort | head -n 1)"
+          fi
+          if [ -z "$DEFCONFIG" ]; then
+            DEFCONFIG="$(find arch/arm64/configs -type f -name '*defconfig'               -printf '%P\n' | sort | head -n 1)"
+          fi
+
+          if ! is_valid_config "$DEFCONFIG"; then
+            echo "No usable ARM64 defconfig was found." >&2
+            echo "Available candidates:" >&2
+            find arch/arm64/configs -type f -name '*defconfig' -printf '%P\n'               | sort | sed -n '1,100p' >&2
+            exit 1
+          fi
+
+          echo "Selected defconfig: $DEFCONFIG"
+          echo "DEFCONFIG=$DEFCONFIG" >> "$GITHUB_ENV"
+          printf '%s\n' "$DEFCONFIG" > ../selected-defconfig.txt
+
+          make O="$OUT_DIR" LLVM=1 LLVM_IAS=1 "$DEFCONFIG"
+
+          scripts/config --file "$OUT_DIR/.config"             -e KSU             -e KPROBES             -e KRETPROBES             -e EXT4_FS
+
+          # Resolve dependencies after changing config symbols.
+          make O="$OUT_DIR" LLVM=1 LLVM_IAS=1 olddefconfig
+
+          grep -E '^(CONFIG_KSU|CONFIG_KPROBES|CONFIG_KRETPROBES|CONFIG_HAVE_SYSCALL_TRACEPOINTS|CONFIG_EXT4_FS)='             "$OUT_DIR/.config" || true
+          grep -q '^CONFIG_KSU=y' "$OUT_DIR/.config"
+          grep -q '^CONFIG_KPROBES=y' "$OUT_DIR/.config"
+          grep -q '^CONFIG_EXT4_FS=y' "$OUT_DIR/.config"
+
+      - name: Build kernel
+        working-directory: kernel
+        run: |
+          set -euxo pipefail
+          make -j"$(nproc)" O="$OUT_DIR" LLVM=1 LLVM_IAS=1 \
+            KCFLAGS=-Wno-error \
+            Image 2>&1 | tee build.log
+
+      - name: Collect artifacts
+        if: always()
+        run: |
+          mkdir -p artifacts
+          cp kernel/build.log artifacts/ 2>/dev/null || true
+          cp selected-defconfig.txt artifacts/ 2>/dev/null || true
+          cp kernel/out/.config artifacts/config 2>/dev/null || true
+          cp kernel/out/arch/arm64/boot/Image artifacts/ 2>/dev/null || true
+          cp kernel/out/arch/arm64/boot/Image.gz artifacts/ 2>/dev/null || true
+          cp kernel/out/arch/arm64/boot/Image.lz4 artifacts/ 2>/dev/null || true
+          find kernel/out/arch/arm64/boot/dts -type f \
+            \( -name '*.dtb' -o -name '*.dtbo' \) -exec cp --parents {} artifacts/ \; \
+            2>/dev/null || true
+
+      - name: Upload build output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: annibale-sukisu-main-${{ github.run_number }}
+          path: artifacts/
+          if-no-files-found: warn
+          retention-days: 14
