@@ -87,12 +87,17 @@ jobs:
           }
 
           is_valid_config() {
-            test -n "$1" && test -f "arch/arm64/configs/$1"
+            test -n "${1:-}" && test -f "arch/arm64/configs/$1"
+          }
+
+          first_match() {
+            find arch/arm64/configs -type f "$@" -printf '%P\n' \
+              | LC_ALL=C sort | sed -n '1p'
           }
 
           DEFCONFIG=""
 
-          # 1. Respect an explicit workflow input when supplied.
+          # 1. Use the optional manual override first.
           if [ -n "$DEFCONFIG_OVERRIDE" ]; then
             DEFCONFIG="$(normalize_config "$DEFCONFIG_OVERRIDE")"
             if ! is_valid_config "$DEFCONFIG"; then
@@ -101,41 +106,32 @@ jobs:
             fi
           fi
 
-          # 2. Look for DEFCONFIG declarations in Android build.config files.
+          # 2. Prefer a device-specific Annibale defconfig.
           if [ -z "$DEFCONFIG" ]; then
-            while IFS= read -r candidate; do
-              candidate="$(normalize_config "$candidate")"
-              if is_valid_config "$candidate"; then
-                DEFCONFIG="$candidate"
-                break
-              fi
-            done < <(
-              grep -RhsE '^[[:space:]]*(export[[:space:]]+)?DEFCONFIG='                 --include='build.config*' . 2>/dev/null               | sed -E 's/^[[:space:]]*(export[[:space:]]+)?DEFCONFIG=["'"']?([^"'"'[:space:]]+).*/\2/'               | awk 'NF && !seen[$0]++'
-            )
+            DEFCONFIG="$(first_match \( -iname '*annibale*defconfig' -o -iname '*annibale*_defconfig' \))"
           fi
 
-          # 3. Prefer a device-specific Annibale defconfig.
-          if [ -z "$DEFCONFIG" ]; then
-            DEFCONFIG="$(
-              find arch/arm64/configs -type f                 \( -iname '*annibale*defconfig' -o -iname '*annibale*_defconfig' \)                 -printf '%P\n' | sort | head -n 1
-            )"
-          fi
-
-          # 4. Fall back to GKI, vendor defconfig, then any arm64 defconfig.
+          # 3. Prefer standard GKI when the device-specific file is absent.
           if [ -z "$DEFCONFIG" ] && is_valid_config "gki_defconfig"; then
             DEFCONFIG="gki_defconfig"
           fi
-          if [ -z "$DEFCONFIG" ]; then
-            DEFCONFIG="$(find arch/arm64/configs/vendor -type f -name '*defconfig'               -printf 'vendor/%P\n' 2>/dev/null | sort | head -n 1)"
+
+          # 4. Fall back to a vendor defconfig, then any ARM64 defconfig.
+          if [ -z "$DEFCONFIG" ] && [ -d arch/arm64/configs/vendor ]; then
+            DEFCONFIG="$(
+              find arch/arm64/configs/vendor -type f -name '*defconfig' -printf 'vendor/%P\n' \
+                | LC_ALL=C sort | sed -n '1p'
+            )"
           fi
           if [ -z "$DEFCONFIG" ]; then
-            DEFCONFIG="$(find arch/arm64/configs -type f -name '*defconfig'               -printf '%P\n' | sort | head -n 1)"
+            DEFCONFIG="$(first_match -name '*defconfig')"
           fi
 
           if ! is_valid_config "$DEFCONFIG"; then
             echo "No usable ARM64 defconfig was found." >&2
             echo "Available candidates:" >&2
-            find arch/arm64/configs -type f -name '*defconfig' -printf '%P\n'               | sort | sed -n '1,100p' >&2
+            find arch/arm64/configs -type f -name '*defconfig' -printf '%P\n' \
+              | LC_ALL=C sort | sed -n '1,100p' >&2
             exit 1
           fi
 
@@ -145,12 +141,16 @@ jobs:
 
           make O="$OUT_DIR" LLVM=1 LLVM_IAS=1 "$DEFCONFIG"
 
-          scripts/config --file "$OUT_DIR/.config"             -e KSU             -e KPROBES             -e KRETPROBES             -e EXT4_FS
+          scripts/config --file "$OUT_DIR/.config" \
+            -e KSU \
+            -e KPROBES \
+            -e KRETPROBES \
+            -e EXT4_FS
 
-          # Resolve dependencies after changing config symbols.
           make O="$OUT_DIR" LLVM=1 LLVM_IAS=1 olddefconfig
 
-          grep -E '^(CONFIG_KSU|CONFIG_KPROBES|CONFIG_KRETPROBES|CONFIG_HAVE_SYSCALL_TRACEPOINTS|CONFIG_EXT4_FS)='             "$OUT_DIR/.config" || true
+          grep -E '^(CONFIG_KSU|CONFIG_KPROBES|CONFIG_KRETPROBES|CONFIG_HAVE_SYSCALL_TRACEPOINTS|CONFIG_EXT4_FS)=' \
+            "$OUT_DIR/.config" || true
           grep -q '^CONFIG_KSU=y' "$OUT_DIR/.config"
           grep -q '^CONFIG_KPROBES=y' "$OUT_DIR/.config"
           grep -q '^CONFIG_EXT4_FS=y' "$OUT_DIR/.config"
